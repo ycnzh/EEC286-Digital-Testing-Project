@@ -6,3 +6,4 @@ mutants/
 results/
 *.out
 *.vvp
+iverilog-12_0/
