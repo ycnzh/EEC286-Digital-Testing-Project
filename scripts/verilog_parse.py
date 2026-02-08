@@ -1,67 +1,101 @@
-from typing import List, Tuple
+from __future__ import annotations
+
+import re
 from dataclasses import dataclass
 from pathlib import Path
-import re
+from typing import List, Optional
 
-@dataclass
+
+@dataclass(frozen=True)
 class Port:
-    direction: str  # input/output
+    direction: str  # "input" or "output"
     name: str
-    width: int      # 1 for scalar, else bus width
+    width: int = 1  # scalar default
 
-@dataclass
+
+@dataclass(frozen=True)
 class ModuleInfo:
     name: str
     ports: List[Port]
     inputs: List[Port]
     outputs: List[Port]
 
-def _bus_width(range_str: str) -> int:
-    m = re.match(r"\[(\d+)\s*:\s*(\d+)\]", range_str.strip())
+
+_COMMENT_LINE = re.compile(r"//.*?$", re.M)
+_COMMENT_BLOCK = re.compile(r"/\*.*?\*/", re.S)
+
+
+def _strip_comments(txt: str) -> str:
+    txt = _COMMENT_BLOCK.sub("", txt)
+    txt = _COMMENT_LINE.sub("", txt)
+    return txt
+
+
+def _bus_width(range_str: Optional[str]) -> int:
+    """
+    range_str examples: [7:0] or [0:7]
+    """
+    if not range_str:
+        return 1
+    m = re.match(r"\[\s*(\d+)\s*:\s*(\d+)\s*\]", range_str.strip())
     if not m:
         return 1
-    a = int(m.group(1))
-    b = int(m.group(2))
+    a, b = int(m.group(1)), int(m.group(2))
     return abs(a - b) + 1
 
-def parse_module_ports(verilog_path: str) -> ModuleInfo:
-    text = Path(verilog_path).read_text()
 
-    # module name
-    mm = re.search(r"\bmodule\s+(\w+)\s*\(", text)
+def _split_names(blob: str) -> List[str]:
+    # split by comma, remove whitespace, ignore empties
+    parts = [p.strip() for p in blob.replace("\n", " ").split(",")]
+    return [p for p in parts if p]
+
+
+def parse_module_ports(verilog_path: str) -> ModuleInfo:
+    """
+    Parse a simple ISCAS-style verilog netlist to extract module name + input/output decls.
+    Works for typical patterns:
+      module c17 (N1, N2, ...);
+      input N1, N2;
+      output N22;
+      wire N10, ...;
+    """
+    text = Path(verilog_path).read_text(encoding="utf-8", errors="ignore")
+    text = _strip_comments(text)
+
+    # module name: module <name> (
+    mm = re.search(r"\bmodule\s+([A-Za-z_]\w*)\s*\(", text)
     if not mm:
-        raise ValueError("Cannot find module declaration")
+        raise ValueError(f"Cannot find module declaration in {verilog_path}")
     mod_name = mm.group(1)
 
     ports: List[Port] = []
 
-    for direction in ["input", "output"]:
-pattern = rf"\b{direction}\b\s*(?:wire\s+|reg\s+)?(\[[^\]]+\]\s*)?([^;]+);"
-        for m in re.finditer(pattern, text):
-            bus = m.group(1)
-            names = m.group(2)
-            width = _bus_width(bus) if bus else 1
-            for name in [n.strip() for n in names.split(",")]:
-                if not name:
-                    continue
-                name = re.split(r"\s|//", name)[0].strip()
-if name in ("input", "output", "wire", "reg"):
-    continue
-                ports.append(Port(direction, name, width))
+    # match declarations like:
+    # input [3:0] a,b;  input wire a;  output reg y;
+    decl_pat = re.compile(
+        r"\b(input|output)\b\s*(?:wire|reg)?\s*(\[[^\]]+\])?\s*([^;]+);",
+        re.I | re.M,
+    )
+
+    for m in decl_pat.finditer(text):
+        direction = m.group(1).lower()
+        bus = m.group(2)
+        names_blob = m.group(3)
+        width = _bus_width(bus)
+        for name in _split_names(names_blob):
+            # defensive: remove accidental trailing/leading tokens
+            name = name.strip()
+            if not name:
+                continue
+            ports.append(Port(direction=direction, name=name, width=width))
 
     inputs = [p for p in ports if p.direction == "input"]
     outputs = [p for p in ports if p.direction == "output"]
-    return ModuleInfo(
-        name=mod_name,
-        ports=ports,
-        inputs=inputs,
-        outputs=outputs
-    )
 
-def total_width(ports: List[Port]) -> int:
-    return sum(p.width for p in ports)
+    if not inputs or not outputs:
+        raise ValueError(
+            f"Parsed ports look empty. inputs={len(inputs)} outputs={len(outputs)}. "
+            f"Check verilog style in {verilog_path}"
+        )
 
-def pack_order(ports: List[Port]) -> List[Tuple[str, int]]:
-    return [(p.name, p.width) for p in ports]
-
-
+    return ModuleInfo(name=mod_name, ports=ports, inputs=inputs, outputs=outputs)
