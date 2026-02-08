@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from .verilog_parse import parse_module_ports
 
-# ----------------------------
+## ----------------------------
 # Parsing fault list
 # ----------------------------
 
