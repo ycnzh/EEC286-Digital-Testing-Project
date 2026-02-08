@@ -7,3 +7,4 @@ results/
 *.out
 *.vvp
 iverilog-12_0/
+__init__.py
