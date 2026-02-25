@@ -1,6 +1,7 @@
 import re
 import os
 import sys
+import argparse
 from collections import defaultdict
 
 # ===========================
@@ -12,17 +13,15 @@ VERILOG_DIR = os.path.join(PROJECT_ROOT, "circuits", "verilog")
 EXPANDED_DIR = os.path.join(PROJECT_ROOT, "circuits", "expanded_verilog")
 os.makedirs(EXPANDED_DIR, exist_ok=True)
 
-# Target circuit
-CIRCUIT_NAME = "c499" 
-INPUT_FILE = os.path.join(VERILOG_DIR, f"{CIRCUIT_NAME}.v")
-OUTPUT_FILE = os.path.join(EXPANDED_DIR, f"{CIRCUIT_NAME}_expanded.v")
-
 # Verilog Primitives
 PRIMITIVES = {'and', 'nand', 'or', 'nor', 'xor', 'xnor', 'not', 'buf'}
 
 class NetlistExpander:
-    def __init__(self, filepath):
-        self.filepath = filepath
+    def __init__(self, circuit_name, input_file, output_file):
+        self.circuit_name = circuit_name
+        self.filepath = input_file
+        self.output_file = output_file
+        
         self.content = ""
         self.module_name = ""
         
@@ -104,7 +103,7 @@ class NetlistExpander:
 
     def expand_branches(self):
         """Creates unique 'K' wire aliases ONLY if fanout > 1."""
-        print(f"--- Analyzing Fanouts for {CIRCUIT_NAME} ---")
+        print(f"--- Analyzing Fanouts for {self.circuit_name} ---")
         
         expanded_count = 0
         
@@ -157,7 +156,7 @@ class NetlistExpander:
             
         lines.append("\nendmodule")
         
-        with open(OUTPUT_FILE, 'w') as f:
+        with open(self.output_file, 'w') as f:
             f.write("\n".join(lines))
 
     def report(self):
@@ -171,7 +170,7 @@ class NetlistExpander:
         total = len(unique_sites)
         
         print("-" * 40)
-        print(f"EXPANSION REPORT: {CIRCUIT_NAME}")
+        print(f"EXPANSION REPORT: {self.circuit_name}")
         print(f"Original Inputs:    {len(self.inputs)}")
         print(f"Original Outputs:   {len(self.outputs)}")
         print(f"Internal Stems:     {len(self.wires)}")
@@ -179,10 +178,25 @@ class NetlistExpander:
         print(f"Total Unique Sites: {total}")
         print(f"Total SSA Faults:   {total * 2}")
         print("-" * 40)
-        print(f"Saved to: {OUTPUT_FILE}")
+        print(f"Saved to: {self.output_file}")
 
 if __name__ == "__main__":
-    expander = NetlistExpander(INPUT_FILE)
+    # Setup Argument Parser
+    parser = argparse.ArgumentParser(description="Expand ISCAS netlist branches for Full Fault Injection.")
+    parser.add_argument("circuit_name", help="Name of the circuit to process (e.g., c17, c432, c499)")
+    
+    # Parse the arguments
+    args = parser.parse_args()
+    circuit_name = args.circuit_name
+
+    # Define dynamic paths based on input
+    input_file = os.path.join(VERILOG_DIR, f"{circuit_name}.v")
+    output_file = os.path.join(EXPANDED_DIR, f"{circuit_name}_expanded.v")
+
+    print(f"--- Processing {circuit_name} ---")
+    
+    # Instantiate and run
+    expander = NetlistExpander(circuit_name, input_file, output_file)
     expander.load_and_clean()
     expander.parse()
     expander.expand_branches()
