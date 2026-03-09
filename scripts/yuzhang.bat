@@ -1,22 +1,25 @@
-@echo off
-setlocal enabledelayedexpansion
+#!/bin/bash
 
-set CIRCUITS=c432 c880 c3540 c7552
+# Define your circuits and target script
+CIRCUITS="c432 c880 c3540 c7552"
+TARGET_SCRIPT="random_sim.py"
 
-set TARGET_SCRIPT=random_sim.py
+echo "==================================================="
+echo "Batch script: $TARGET_SCRIPT"
+echo "==================================================="
 
-echo ===================================================
-echo Batch script: %TARGET_SCRIPT%
-echo ===================================================
+# Loop through each circuit and run the script
+for C in $CIRCUITS; do
+    echo ""
+    echo "[*] Processing Circuit: $C"
+    python3 "$TARGET_SCRIPT" "$C"
+done
 
-for %%C in (%CIRCUITS%) do (
-    echo.
-    echo [*] Processing Circuit: %%C
-    python %TARGET_SCRIPT% %%C
-)
+echo ""
+echo "==================================================="
+echo "All simulations completed."
+echo "==================================================="
 
-echo.
-echo ===================================================
-echo All simulations completed.
-echo ===================================================
-pause
+# Equivalent to the Windows 'pause' command
+read -n 1 -s -r -p "Press any key to continue..."
+echo ""
