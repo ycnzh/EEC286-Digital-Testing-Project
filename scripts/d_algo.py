@@ -22,7 +22,7 @@ from collections import defaultdict
 #  CONFIGURATION
 # ============================================================
 TIMEOUT_SECONDS = 18000     # 30 minutes
-TARGET_COVERAGE = 90.0
+TARGET_COVERAGE = 97.0
 MIN_IMPROVEMENT = 0.1      # 0.1% improvement required...
 BATCH_SIZE = 100           # ...over a batch of 100 vectors for ATPG
 

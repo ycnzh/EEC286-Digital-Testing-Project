@@ -19,8 +19,8 @@ import time
 # ============================================================
 #  CONFIGURATION
 # ============================================================
-TIMEOUT_SECONDS = 1800     # 30 minutes
-TARGET_COVERAGE = 95.0
+TIMEOUT_SECONDS = 18000    # 300 minutes
+TARGET_COVERAGE = 97.0
 MIN_IMPROVEMENT = 0.1      # 0.1% improvement required...
 BATCH_SIZE = 100           # ...over a batch of 100 vectors
 
