@@ -1,10 +1,30 @@
+#!/usr/bin/env python3
+"""
+ISCAS PODEM ATPG Simulator (with CSV Data Logging) - FIXED DEADLOCK
+================================================================
+- Generates targeted test vectors using Path-Oriented Decision Making.
+- Employs Union-Find equivalence fault collapsing.
+- Logs per-vector coverage data to a CSV file for MATLAB plotting.
+- Stops if:
+  1. Coverage reaches 95%
+  2. Runtime exceeds 30 minutes
+  3. Coverage improves by less than 0.1% over a batch of 100 vectors
+"""
+
 import sys
 import os
 import time
 import random
-import argparse
 import re
 from collections import defaultdict
+
+# ============================================================
+#  CONFIGURATION
+# ============================================================
+TIMEOUT_SECONDS = 18000     # 300 minutes
+TARGET_COVERAGE = 95.0
+MIN_IMPROVEMENT = 0.1      # 0.1% improvement required...
+BATCH_SIZE = 100           # ...over a batch of 100 vectors for ATPG
 
 # ==========================================
 # 1. Netlist Parsing & Data Structures
@@ -13,8 +33,8 @@ class Node:
     def __init__(self, name, node_type="wire"):
         self.name = name
         self.type = node_type 
-        self.value = None       # Used for single-value fault dropping
-        self.val5 = (None, None) # Used for PODEM 5-value logic (Good, Faulty)
+        self.value = None       
+        self.val5 = (None, None) 
         self.driven_by = None 
         self.drives = []      
 
@@ -75,11 +95,19 @@ def parse_expanded_netlist(filepath):
                 
     return circuit
 
+def parse_fault_report(filepath):
+    faults = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if re.match(r'STEM:(\w+)\s+SA([01])', line) or re.match(r'BRANCH:(\w+)->(\w+)\s+SA([01])', line):
+                faults.append(line)
+    return len(faults)
+
 # ==========================================
 # 2. Strict Equivalence Collapsing
 # ==========================================
 def build_equivalence_classes(circuit):
-    print("[*] Performing Strict Equivalence Fault Collapsing...")
     parent = {}
     for name in circuit.nodes:
         parent[(name, 0)] = (name, 0)
@@ -125,9 +153,7 @@ def build_equivalence_classes(circuit):
     for fault in parent.keys():
         equiv_map[find(fault)].append(fault)
         
-    print(f"[*] Total Uncollapsed Faults: {len(parent)}")
-    print(f"[*] Unique Equivalence Classes (Collapsed Roots): {len(equiv_map)}")
-    return equiv_map
+    return equiv_map, len(parent)
 
 # ==========================================
 # 3. Fast Single-Value Simulator (For Dropping)
@@ -167,10 +193,9 @@ def compute_detected_roots(circuit, vector, active_roots):
     return [root for root in active_roots if simulate_fast(circuit, vector, fault=root) != golden]
 
 # ==========================================
-# 4. PODEM ATPG ENGINE
+# 4. PODEM ATPG ENGINE (WITH DEADLOCK FIXES)
 # ==========================================
 def eval_loose(g_type, in_vals):
-    """Evaluates logic safely handling Nones (X's)"""
     if g_type in ['not', 'buf']:
         if in_vals[0] is None: return None
         return 1 - in_vals[0] if g_type == 'not' else in_vals[0]
@@ -191,7 +216,6 @@ def eval_loose(g_type, in_vals):
     return None
 
 def imply_5val(circuit, pi_assigns, fault):
-    """Forward Implication simulating Good and Faulty circuits simultaneously."""
     for n in circuit.nodes.values(): n.val5 = (None, None)
     for pi, v in pi_assigns.items():
         circuit.nodes[pi].val5 = (v, fault[1] if pi == fault[0] else v)
@@ -214,29 +238,28 @@ def imply_5val(circuit, pi_assigns, fault):
                     progress = True
 
 def get_objective(circuit, fault):
-    """Finds the next objective (Node, Value) to activate or propagate the fault."""
     f_node, stuck_val = fault
     f_val5 = circuit.nodes[f_node].val5
     
-    # Objective 1: Activate the fault
-    if f_val5[0] != 1 - stuck_val:
+    # [BUG FIX 1] 冲突检测：如果节点已经被赋成了我们不想要的值，必须返回 None 触发回溯
+    if f_val5[0] == stuck_val:
+        return None 
+        
+    if f_val5[0] is None:
         return (f_node, 1 - stuck_val)
 
-    # Objective 2: Find a D-Frontier Gate to propagate through
     d_front = []
     for name, node in circuit.nodes.items():
-        if node.val5[0] is None or node.val5[1] is None: # Output is X
+        if node.val5[0] is None or node.val5[1] is None: 
             if node.driven_by:
-                # Is any input holding D or D_bar?
                 for i in node.driven_by[1]:
                     v = circuit.nodes[i].val5
                     if v[0] is not None and v[1] is not None and v[0] != v[1]:
                         d_front.append(name)
                         break
                         
-    if not d_front: return None # Fault blocked (X-Path exhausted)
+    if not d_front: return None 
     
-    # Pick first D-frontier gate and find its non-controlling input value
     gate_name = d_front[0]
     g_type, ins = circuit.nodes[gate_name].driven_by
     nc_val = 1 if g_type in ['and', 'nand'] else 0 
@@ -248,45 +271,47 @@ def get_objective(circuit, fault):
     return None
 
 def backtrace(circuit, curr_node, curr_val):
-    """Traces an objective backward to a Primary Input."""
     while circuit.nodes[curr_node].type != "input":
         g_type, ins = circuit.nodes[curr_node].driven_by
         if g_type in ['nand', 'nor', 'not']:
             curr_val = 1 - curr_val
             
-        # Follow an X path backwards
+        # [BUG FIX 2] 防御性步进机制，防止所有输入均不为 None 时的死循环
+        moved = False
         for i in ins:
             if circuit.nodes[i].val5[0] is None:
                 curr_node = i
+                moved = True
                 break
+                
+        # 兜底：如果没找到未知状态，强行退一步以打破死锁
+        if not moved and ins:
+            curr_node = ins[0]
+            
     return curr_node, curr_val
 
 def podem_recurse(circuit, fault, pi_assigns, stats):
-    if stats['backtracks'] > 50: return False # Backtrack Limit
+    if stats['backtracks'] > 50: return False 
 
     imply_5val(circuit, pi_assigns, fault)
 
-    # Check Success: Is fault effect visible at ANY Primary Output?
     for po in circuit.outputs:
         v = circuit.nodes[po].val5
         if v[0] is not None and v[1] is not None and v[0] != v[1]:
             return True
 
     obj = get_objective(circuit, fault)
-    if not obj: return False
+    if not obj: return False # 如果触发冲突，此处会平滑回溯
 
     pi, val = backtrace(circuit, obj[0], obj[1])
 
-    # Try standard decision
     pi_assigns[pi] = val
     if podem_recurse(circuit, fault, pi_assigns, stats): return True
 
-    # Try reverse decision (Backtracking)
     stats['backtracks'] += 1
     pi_assigns[pi] = 1 - val
     if podem_recurse(circuit, fault, pi_assigns, stats): return True
 
-    # Undo
     stats['backtracks'] += 1
     del pi_assigns[pi]
     return False
@@ -297,85 +322,120 @@ def generate_podem_vector(circuit, fault):
     
     success = podem_recurse(circuit, fault, pi_assigns, stats)
     
-    # Fill remaining unassigned PIs randomly
     for pi in circuit.inputs:
         if pi not in pi_assigns:
             pi_assigns[pi] = random.choice([0, 1])
             
-    return pi_assigns # Even if PODEM aborted, return the partially random vector
+    return pi_assigns 
 
 # ==========================================
 # 5. Main Loop
 # ==========================================
-def run_atpg(filepath, user_total_faults):
-    circuit = parse_expanded_netlist(filepath)
-    actual_uncollapsed = len(circuit.nodes) * 2
-    if user_total_faults != actual_uncollapsed:
-        user_total_faults = actual_uncollapsed
+def run_podem(circuit_name):
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    netlist_path = os.path.join(base_dir, 'circuits', 'expanded_verilog', f'{circuit_name}_expanded.v')
+    fault_report_path = os.path.join(base_dir, 'experiment_results', f'{circuit_name}_faults.txt')
+    
+    # Fallback to the other naming convention if the first one fails
+    if not os.path.exists(fault_report_path):
+         fault_report_path = os.path.join(base_dir, 'experiment_results', f'fault_report_{circuit_name}.txt')
+    
+    plot_dir = os.path.join(base_dir, 'coverage_results', 'plot_data')
+    os.makedirs(plot_dir, exist_ok=True)
+    csv_file = os.path.join(plot_dir, f'podem_sim_{circuit_name}.csv')
+    
+    if not os.path.exists(netlist_path) or not os.path.exists(fault_report_path):
+        print(f"Error: Missing files for {circuit_name}")
+        return
 
-    equiv_map = build_equivalence_classes(circuit)
+    print(f"[*] Parsing netlist: {netlist_path}")
+    circuit = parse_expanded_netlist(netlist_path)
+    
+    total_faults = parse_fault_report(fault_report_path)
+    
+    print("[*] Performing Strict Equivalence Fault Collapsing...")
+    equiv_map, uncollapsed_count = build_equivalence_classes(circuit)
+    if total_faults == 0: total_faults = uncollapsed_count
+
     F = list(equiv_map.keys())
+    
+    print(f"[*] Total Uncollapsed Faults: {total_faults}")
+    print(f"[*] Unique Equivalence Classes (Collapsed Roots): {len(equiv_map)}")
+    print(f"[*] Data Log       : {csv_file}")
     
     total_non_col_det = 0
     vectors_generated = 0
+    last_batch_coverage = 0.0
+    stop_reason = ""
     
-    print("-" * 65)
-    print(f"{'Time(s)':<10} | {'Vectors':<10} | {'Non-Col Detected':<16} | {'Coverage':<10}")
-    print("-" * 65)
+    print("-" * 68)
+    print(f"{'Time(s)':<10} | {'Vectors':<10} | {'Detected':<10} | {'Coverage':<10}")
+    print("-" * 68)
     
+    random.seed(42)
     start_time = time.time()
     
-    while True:
-        elapsed_time = time.time() - start_time
-        coverage = total_non_col_det / user_total_faults
+    with open(csv_file, 'w') as f_csv:
+        f_csv.write("Vector_Index,Time_Seconds,Total_Detected,Delta_Detected,Coverage_Percent,Delta_Coverage\n")
         
-        # --- UPDATED STOP CONDITIONS ---
-        if elapsed_time > 600:
-            print(f"\n[STOP] Time limit of 10 minutes exceeded.")
-            print(f"[RESULT] Final Coverage achieved: {coverage*100:.2f}%")
-            break
+        while True:
+            elapsed_time = time.time() - start_time
+            coverage_percent = (total_non_col_det / total_faults) * 100.0
             
-        if coverage >= 0.95:
-            print(f"{elapsed_time:<10.1f} | {vectors_generated:<10} | {total_non_col_det:<16} | {coverage*100:.2f}%")
-            print(f"\n[STOP] Target fault coverage of 95% reached.")
-            print(f"[RESULT] Total Run Time: {elapsed_time:.2f} seconds.")
-            break
+            # --- STOP CONDITIONS ---
+            if elapsed_time > TIMEOUT_SECONDS:
+                stop_reason = "30 Minute Time Limit Exceeded"
+                break
+                
+            if coverage_percent >= TARGET_COVERAGE:
+                stop_reason = "95% Coverage Reached"
+                break
+                
+            if not F:
+                stop_reason = "All collapsible faults detected (Plateau)"
+                break
+                
+            if vectors_generated > 0 and vectors_generated % BATCH_SIZE == 0:
+                improvement = coverage_percent - last_batch_coverage
+                if improvement < MIN_IMPROVEMENT:
+                    stop_reason = f"Coverage plateaued (<{MIN_IMPROVEMENT}% improvement over {BATCH_SIZE} vectors)"
+                    break
+                last_batch_coverage = coverage_percent
+            # -------------------------------
+                
+            target_f = random.choice(F)
+            vector = generate_podem_vector(circuit, target_f)
+            vectors_generated += 1
             
-        if not F:
-            print("\n[STOP] All collapsible faults detected. Coverage plateau.")
-            print(f"[RESULT] Plateaued at {coverage*100:.2f}% in {elapsed_time:.2f} seconds.")
-            break
-        # -------------------------------
+            detected_roots = compute_detected_roots(circuit, vector, F)
+            delta_detected = 0
             
-        target_f = random.choice(F)
-        vector = generate_podem_vector(circuit, target_f)
-        vectors_generated += 1
-        
-        detected_roots = compute_detected_roots(circuit, vector, F)
-        
-        if detected_roots:
-            for root in detected_roots:
-                total_non_col_det += len(equiv_map[root])
-                F.remove(root) 
-            coverage = total_non_col_det / user_total_faults
-            print(f"{elapsed_time:<10.1f} | {vectors_generated:<10} | {total_non_col_det:<16} | {coverage*100:.2f}%")
-        elif vectors_generated % 50 == 0:
-            print(f"{elapsed_time:<10.1f} | {vectors_generated:<10} | {total_non_col_det:<16} | {coverage*100:.2f}% (Searching...)")
+            if detected_roots:
+                for root in detected_roots:
+                    delta_detected += len(equiv_map[root])
+                    F.remove(root) 
+                    
+                total_non_col_det += delta_detected
+                coverage_percent = (total_non_col_det / total_faults) * 100.0
+                print(f"{elapsed_time:<10.1f} | {vectors_generated:<10} | {total_non_col_det:<10} | {coverage_percent:.2f}%")
+            
+            delta_coverage = (delta_detected / total_faults) * 100.0
+            f_csv.write(f"{vectors_generated},{elapsed_time:.4f},{total_non_col_det},{delta_detected},{coverage_percent:.4f},{delta_coverage:.4f}\n")
 
     final_time = time.time() - start_time
-    print("=" * 65)
+    print("=" * 68)
     print("FINAL PODEM ATPG REPORT")
-    print(f"Total Time:             {final_time:.10f} seconds")
-    print(f"Test Vectors Generated: {vectors_generated}")
-    print(f"Full Faults Detected:   {total_non_col_det} / {user_total_faults}")
-    print(f"Final Coverage:         {(total_non_col_det / user_total_faults) * 100:.2f}%")
-    print("=" * 65)
+    print("=" * 68)
+    print(f"Stop Reason             : {stop_reason}")
+    print(f"Total Time              : {final_time:.10f} seconds")
+    print(f"Test Vectors Generated  : {vectors_generated}")
+    print(f"Full Faults Detected    : {total_non_col_det} / {total_faults}")
+    print(f"Final Coverage          : {coverage_percent:.2f}%")
+    print(f"Plot Data Saved To      : {csv_file}")
+    print("=" * 68)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("netlist", help="Path to the expanded Verilog netlist")
-    parser.add_argument("total_faults", type=int, help="Total non-collapsed faults")
-    args = parser.parse_args()
-    if not os.path.exists(args.netlist):
+    if len(sys.argv) < 2:
+        print("Usage: python3 scripts/podem.py <circuit_name>")
         sys.exit(1)
-    run_atpg(args.netlist, args.total_faults)
+    run_podem(sys.argv[1])

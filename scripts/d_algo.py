@@ -1,10 +1,30 @@
+#!/usr/bin/env python3
+"""
+ISCAS D-Algorithm ATPG Simulator (with CSV Data Logging)
+================================================================
+- Generates targeted test vectors using structural backtracing.
+- Employs Union-Find equivalence fault collapsing.
+- Logs per-vector coverage data to a CSV file for MATLAB plotting.
+- Stops if:
+  1. Coverage reaches 95%
+  2. Runtime exceeds 30 minutes
+  3. Coverage improves by less than 0.1% over a batch of 100 vectors
+"""
+
 import sys
 import os
 import time
 import random
-import argparse
 import re
-from collections import defaultdict, deque
+from collections import defaultdict
+
+# ============================================================
+#  CONFIGURATION
+# ============================================================
+TIMEOUT_SECONDS = 18000     # 30 minutes
+TARGET_COVERAGE = 90.0
+MIN_IMPROVEMENT = 0.1      # 0.1% improvement required...
+BATCH_SIZE = 100           # ...over a batch of 100 vectors for ATPG
 
 # ==========================================
 # 1. Netlist Parsing & Data Structures
@@ -29,9 +49,7 @@ class Circuit:
         return self.nodes[name]
 
 def parse_expanded_netlist(filepath):
-    print(f"[*] Parsing netlist: {filepath}")
     circuit = Circuit()
-    
     with open(filepath, 'r') as f:
         content = f.read()
         
@@ -78,15 +96,23 @@ def parse_expanded_netlist(filepath):
                 
     return circuit
 
+def parse_fault_report(filepath):
+    # Used solely to get the exact baseline fault count for accurate coverage %
+    faults = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if re.match(r'STEM:(\w+)\s+SA([01])', line) or re.match(r'BRANCH:(\w+)->(\w+)\s+SA([01])', line):
+                faults.append(line)
+    return len(faults)
+
 # ==========================================
 # 2. Strict Equivalence Collapsing (Union-Find)
 # ==========================================
 def build_equivalence_classes(circuit):
-    print("[*] Performing Strict Equivalence Fault Collapsing...")
-    
     parent = {}
     
-    # 1. Initialize Disjoint Set (Every fault is its own root)
+    # Initialize Disjoint Set
     for name in circuit.nodes:
         parent[(name, 0)] = (name, 0)
         parent[(name, 1)] = (name, 1)
@@ -97,14 +123,12 @@ def build_equivalence_classes(circuit):
         return parent[i]
 
     def union(in_fault, out_fault):
-        # We purposely make the OUT_FAULT the root. 
-        # This makes ATPG justification much easier later!
         root_in = find(in_fault)
         root_out = find(out_fault)
         if root_in != root_out:
             parent[root_in] = root_out
 
-    # 2. Apply rules ONLY if input fanout is exactly 1
+    # Apply rules ONLY if input fanout is exactly 1
     for name, node in circuit.nodes.items():
         if not node.driven_by: continue
         
@@ -132,16 +156,13 @@ def build_equivalence_classes(circuit):
                 union((ins[0], 0), (out_n, 0))
                 union((ins[0], 1), (out_n, 1))
 
-    # 3. Build the final mapping
+    # Build the final mapping
     equiv_map = defaultdict(list)
     for fault in parent.keys():
         root = find(fault)
         equiv_map[root].append(fault)
         
-    print(f"[*] Total Uncollapsed Faults: {len(parent)}")
-    print(f"[*] Unique Equivalence Classes (Collapsed Roots): {len(equiv_map)}")
-    
-    return equiv_map
+    return equiv_map, len(parent)
 
 # ==========================================
 # 3. Logic & Fault Simulator
@@ -159,18 +180,15 @@ def evaluate_gate(g_type, in_vals):
     return None
 
 def simulate(circuit, vector, fault=None):
-    # Reset circuit
     for node in circuit.nodes.values():
         node.value = None
         
-    # Apply PI vector 
     for pi, val in vector.items():
         if fault and pi == fault[0]:
             circuit.nodes[pi].value = fault[1]
         else:
             circuit.nodes[pi].value = val
             
-    # Streamlined Topological Evaluation
     progress = True
     while progress:
         progress = False
@@ -235,7 +253,6 @@ def d_algorithm_generate(circuit, fault):
     except RecursionError:
         pass 
         
-    # Fill remaining PIs randomly to aid propagation
     for pi in circuit.inputs:
         if pi not in vector:
             vector[pi] = random.choice([0, 1])
@@ -245,89 +262,114 @@ def d_algorithm_generate(circuit, fault):
 # ==========================================
 # 5. Main ATPG Loop
 # ==========================================
-def run_atpg(filepath, user_total_faults):
-    circuit = parse_expanded_netlist(filepath)
+def run_d_algo(circuit_name):
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    netlist_path = os.path.join(base_dir, 'circuits', 'expanded_verilog', f'{circuit_name}_expanded.v')
+    fault_report_path = os.path.join(base_dir, 'experiment_results', f'fault_report_{circuit_name}.txt')
     
-    # Check for User Error in calculation
-    actual_uncollapsed_faults = len(circuit.nodes) * 2
-    if user_total_faults != actual_uncollapsed_faults:
-        print(f"\n[WARNING] You inputted {user_total_faults} total faults, but the parsed netlist contains exactly {actual_uncollapsed_faults} fault sites (*2). Using {actual_uncollapsed_faults} for mathematically accurate coverage.")
-        user_total_faults = actual_uncollapsed_faults
+    # Setup Data Logging Directory
+    plot_dir = os.path.join(base_dir, 'coverage_results', 'plot_data')
+    os.makedirs(plot_dir, exist_ok=True)
+    csv_file = os.path.join(plot_dir, f'dalgo_sim_{circuit_name}.csv')
+    
+    if not os.path.exists(netlist_path) or not os.path.exists(fault_report_path):
+        print(f"Error: Missing files for {circuit_name}")
+        return
 
-    equiv_map = build_equivalence_classes(circuit)
+    print(f"[*] Parsing netlist: {netlist_path}")
+    circuit = parse_expanded_netlist(netlist_path)
     
-    # F is now just the list of "Root" representative faults
+    # Use actual parsed fault count to ensure coverage % matches random scripts perfectly
+    total_faults = parse_fault_report(fault_report_path)
+    
+    print("[*] Performing Strict Equivalence Fault Collapsing...")
+    equiv_map, uncollapsed_count = build_equivalence_classes(circuit)
+    
+    # Fallback in case fault report parsing failed or differs slightly
+    if total_faults == 0: total_faults = uncollapsed_count
+
     F = list(equiv_map.keys())
+    
+    print(f"[*] Total Uncollapsed Faults: {total_faults}")
+    print(f"[*] Unique Equivalence Classes (Collapsed Roots): {len(equiv_map)}")
+    print(f"[*] Data Log       : {csv_file}")
     
     total_non_collapsed_detected = 0
     vectors_generated = 0
+    last_batch_coverage = 0.0
+    stop_reason = ""
     
-    print("-" * 65)
-    print(f"{'Time(s)':<10} | {'Vectors':<10} | {'Non-Col Detected':<16} | {'Coverage':<10}")
-    print("-" * 65)
+    print("-" * 68)
+    print(f"{'Time(s)':<10} | {'Vectors':<10} | {'Detected':<10} | {'Coverage':<10}")
+    print("-" * 68)
     
+    random.seed(42)
     start_time = time.time()
     
-    while True:
-        elapsed_time = time.time() - start_time
-        coverage = total_non_collapsed_detected / user_total_faults
+    with open(csv_file, 'w') as f_csv:
+        f_csv.write("Vector_Index,Time_Seconds,Total_Detected,Delta_Detected,Coverage_Percent,Delta_Coverage\n")
         
-        # --- UPDATED STOP CONDITIONS ---
-        if elapsed_time > 600:
-            print(f"\n[STOP] Time limit of 10 minutes exceeded.")
-            print(f"[RESULT] Final Coverage achieved: {coverage*100:.2f}%")
-            break
+        while True:
+            elapsed_time = time.time() - start_time
+            coverage_percent = (total_non_collapsed_detected / total_faults) * 100.0
             
-        if coverage >= 0.95:
-            # Print final hit before breaking
-            print(f"{elapsed_time:<10.1f} | {vectors_generated:<10} | {total_non_collapsed_detected:<16} | {coverage*100:.2f}%")
-            print(f"\n[STOP] Target fault coverage of 95% reached.")
-            print(f"[RESULT] Total Run Time: {elapsed_time:.2f} seconds.")
-            break
-            
-        if not F:
-            print("\n[STOP] All collapsible faults detected. Coverage plateau.")
-            print(f"[RESULT] Plateaued at {coverage*100:.2f}% in {elapsed_time:.2f} seconds.")
-            break
-        # -------------------------------
-            
-        target_f = random.choice(F)
-        vector = d_algorithm_generate(circuit, target_f)
-        vectors_generated += 1
-        
-        detected_roots = compute_detected_roots(circuit, vector, F)
-        
-        if detected_roots:
-            for root in detected_roots:
-                # Add the ENTIRE equivalence class size to the detected count
-                total_non_collapsed_detected += len(equiv_map[root])
-                F.remove(root) # Drop the root from active search
+            # --- STOP CONDITIONS ---
+            if elapsed_time > TIMEOUT_SECONDS:
+                stop_reason = "30 Minute Time Limit Exceeded"
+                break
                 
-            coverage = total_non_collapsed_detected / user_total_faults
-            print(f"{elapsed_time:<10.1f} | {vectors_generated:<10} | {total_non_collapsed_detected:<16} | {coverage*100:.2f}%")
-        
-        # Heartbeat
-        elif vectors_generated % 50 == 0:
-            print(f"{elapsed_time:<10.1f} | {vectors_generated:<10} | {total_non_collapsed_detected:<16} | {coverage*100:.2f}% (Searching...)")
+            if coverage_percent >= TARGET_COVERAGE:
+                stop_reason = "95% Coverage Reached"
+                break
+                
+            if not F:
+                stop_reason = "All collapsible faults detected (Plateau)"
+                break
+                
+            if vectors_generated > 0 and vectors_generated % BATCH_SIZE == 0:
+                improvement = coverage_percent - last_batch_coverage
+                if improvement < MIN_IMPROVEMENT:
+                    stop_reason = f"Coverage plateaued (<{MIN_IMPROVEMENT}% improvement over {BATCH_SIZE} vectors)"
+                    break
+                last_batch_coverage = coverage_percent
+            # -------------------------------
+                
+            target_f = random.choice(F)
+            vector = d_algorithm_generate(circuit, target_f)
+            vectors_generated += 1
+            
+            detected_roots = compute_detected_roots(circuit, vector, F)
+            delta_detected = 0
+            
+            if detected_roots:
+                for root in detected_roots:
+                    delta_detected += len(equiv_map[root])
+                    F.remove(root)
+                    
+                total_non_collapsed_detected += delta_detected
+                coverage_percent = (total_non_collapsed_detected / total_faults) * 100.0
+                print(f"{elapsed_time:<10.1f} | {vectors_generated:<10} | {total_non_collapsed_detected:<10} | {coverage_percent:.2f}%")
+            
+            delta_coverage = (delta_detected / total_faults) * 100.0
+            
+            # Write to CSV for MATLAB plotting
+            f_csv.write(f"{vectors_generated},{elapsed_time:.4f},{total_non_collapsed_detected},{delta_detected},{coverage_percent:.4f},{delta_coverage:.4f}\n")
 
     final_time = time.time() - start_time
-    print("=" * 65)
-    print("FINAL ATPG REPORT")
-    print(f"Total Time:             {final_time:.2f} seconds")
-    print(f"Test Vectors Generated: {vectors_generated}")
-    print(f"Full Faults Detected:   {total_non_collapsed_detected} / {user_total_faults}")
-    print(f"Final Coverage:         {(total_non_collapsed_detected / user_total_faults) * 100:.2f}%")
-    print("=" * 65)
+    print("=" * 68)
+    print("FINAL D-ALGORITHM REPORT")
+    print("=" * 68)
+    print(f"Stop Reason             : {stop_reason}")
+    print(f"Total Time              : {final_time:.2f} seconds")
+    print(f"Test Vectors Generated  : {vectors_generated}")
+    print(f"Full Faults Detected    : {total_non_collapsed_detected} / {total_faults}")
+    print(f"Final Coverage          : {coverage_percent:.2f}%")
+    print(f"Plot Data Saved To      : {csv_file}")
+    print("=" * 68)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ATPG Loop with Equivalence Collapsing")
-    parser.add_argument("netlist", help="Path to the expanded Verilog netlist")
-    parser.add_argument("total_faults", type=int, help="Total number of non-collapsed faults (e.g., 46 for c17)")
-    
-    args = parser.parse_args()
-    
-    if not os.path.exists(args.netlist):
-        print(f"Error: Could not find netlist {args.netlist}")
+    if len(sys.argv) < 2:
+        print("Usage: python3 scripts/d_algo.py <circuit_name>")
         sys.exit(1)
         
-    run_atpg(args.netlist, args.total_faults)
+    run_d_algo(sys.argv[1])

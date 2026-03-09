@@ -1,0 +1,32 @@
+====================================================================
+  ISCAS c17 – Iterative Test Generation + Fault Dropping
+--------------------------------------------------------------------
+
+[Phase 1] Main loop
+
+  [Phase1] v=00000  +  9 | det=   9 rem=  25 cov=26.47%  [0.0s]
+  [Phase1] v=00001  +  5 | det=  14 rem=  20 cov=41.18%  [0.0s]
+  [Phase1] v=00011  +  2 | det=  16 rem=  18 cov=47.06%  [0.0s]
+  [Phase1] v=00100  +  1 | det=  17 rem=  17 cov=50.00%  [0.0s]
+  [Phase1] v=00101  +  1 | det=  18 rem=  16 cov=52.94%  [0.0s]
+  [Phase1] v=00111  +  5 | det=  23 rem=  11 cov=67.65%  [0.0s]
+  [Phase1] v=01000  +  6 | det=  29 rem=   5 cov=85.29%  [0.0s]
+  [Phase1] v=01110  +  1 | det=  30 rem=   4 cov=88.24%  [0.0s]
+  [Phase1] v=10000  +  1 | det=  31 rem=   3 cov=91.18%  [0.0s]
+  [Phase1] v=10100  +  3 | det=  34 rem=   0 cov=100.00%  [0.0s]
+
+====================================================================
+  FINAL REPORT
+====================================================================
+  Circuit          : c17
+  Stop reason      : 95.0% Coverage Reached
+  Total faults     : 34
+  Detected faults  : 34
+  Remaining faults : 0
+  Fault coverage   : 100.00%
+  Test set size    : 10 vectors
+  Vectors examined : 21
+  Elapsed time     : 0.00s
+--------------------------------------------------------------------
+  Plot Data Saved  : D:\EEC286-Digital-Testing-Project\coverage_results\plot_data\twophase_sim_c17.csv
+====================================================================

@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
 """
-Universal ISCAS Fault Simulator  (v3 – timeout + targeted mode)
+Universal ISCAS Fault Simulator (2-Phase Random + CSV Logging)
 ================================================================
-- Stops each circuit after 10 minutes, saves whatever coverage was achieved
-- When random phase stalls, switches to per-fault targeted search
-- Batch mode: run all circuits in sequence
-
-Usage (single circuit):
-    python3 scripts/fault_sim.py c432
-
-Usage (all circuits):
-    python3 scripts/fault_sim.py all
-
-Reads:
-    circuits/expanded_verilog/<circuit>_expanded.v
-    experiment_results/fault_report_<circuit>.txt
-
-Writes:
-    coverage_results/coverage_<circuit>.txt
+- Stops each circuit after 30 minutes.
+- Stops if coverage reaches 95%.
+- Stops if coverage plateau hit (<0.1% improvement over 5000 vectors).
+- Logs per-vector coverage data to a CSV file for MATLAB plotting.
 """
 
 import sys, re, random, os, math, time
@@ -26,22 +14,23 @@ import sys, re, random, os, math, time
 #  CONFIGURATION
 # ============================================================
 
-TIMEOUT_SECONDS      = 600     # 10 minutes per circuit
-STALL_THRESHOLD      = 200     # consecutive misses before targeted mode
-TARGETED_RAND_TRIES  = 3000    # random attempts per fault in targeted mode
-TARGETED_EXHAUST_BITS = 18     # bits to exhaustively sweep in targeted mode
-MAX_EXHAUSTIVE_INPUTS = 20     # use exhaustive enumeration if n_in <= this
+TIMEOUT_SECONDS       = 1800    # 30 minutes per circuit
+TARGET_COVERAGE       = 95.0
+MIN_IMPROVEMENT       = 0.1     # 0.1% improvement required...
+BATCH_SIZE            = 5000    # ...over a batch of 5000 vectors (to allow Phase 2 to work)
+
+STALL_THRESHOLD       = 200     # consecutive misses before targeted mode
+TARGETED_RAND_TRIES   = 3000    # random attempts per fault in targeted mode
+TARGETED_EXHAUST_BITS = 18      # bits to exhaustively sweep in targeted mode
+MAX_EXHAUSTIVE_INPUTS = 20      # use exhaustive enumeration if n_in <= this
 
 ALL_CIRCUITS = [
-    'c17', 'c432', 'c499', 'c880',
-    'c1355', 'c1908', 'c2670', 'c3540',
-    'c5315', 'c6288', 'c7552'
+    'c432'
 ]
 
 # ============================================================
 #  1.  PARSER: expanded_verilog
 # ============================================================
-
 def parse_expanded_verilog(filepath):
     with open(filepath) as f:
         content = f.read()
@@ -74,11 +63,9 @@ def parse_expanded_verilog(filepath):
 
     return inputs, outputs, k_assign, gates
 
-
 # ============================================================
 #  2.  PARSER: fault_report
 # ============================================================
-
 def parse_fault_report(filepath):
     faults = []
     with open(filepath) as f:
@@ -93,11 +80,9 @@ def parse_fault_report(filepath):
                 faults.append(('BRANCH', m.group(1), m.group(2), int(m.group(3))))
     return faults
 
-
 # ============================================================
 #  3.  CIRCUIT EVALUATOR
 # ============================================================
-
 def evaluate(gates, k_assign, input_names, input_vals, fault=None):
     net = dict(zip(input_names, input_vals))
 
@@ -139,24 +124,23 @@ def evaluate(gates, k_assign, input_names, input_vals, fault=None):
 
     return net
 
-
 # ============================================================
 #  4.  RUN ONE CIRCUIT
 # ============================================================
-
 def run(circuit_name, base_dir=None):
-
     if base_dir is None:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    verilog_file = os.path.join(base_dir, 'circuits', 'expanded_verilog',
-                                f'{circuit_name}_expanded.v')
-    fault_file   = os.path.join(base_dir, 'experiment_results',
-                                f'fault_report_{circuit_name}.txt')
-    out_dir      = os.path.join(base_dir, 'coverage_results')
-    out_file     = os.path.join(out_dir, f'coverage_{circuit_name}.txt')
-
-    os.makedirs(out_dir, exist_ok=True)
+    verilog_file = os.path.join(base_dir, 'circuits', 'expanded_verilog', f'{circuit_name}_expanded.v')
+    fault_file   = os.path.join(base_dir, 'experiment_results', f'fault_report_{circuit_name}.txt')
+    
+    # Text and CSV log paths
+    out_dir  = os.path.join(base_dir, 'coverage_results')
+    plot_dir = os.path.join(out_dir, 'plot_data')
+    os.makedirs(plot_dir, exist_ok=True)
+    
+    out_file = os.path.join(out_dir, f'coverage_{circuit_name}.txt')
+    csv_file = os.path.join(plot_dir, f'twophase_sim_{circuit_name}.csv')
 
     # ---- parse ----
     print(f"[1/4] Parsing netlist  : {verilog_file}")
@@ -167,7 +151,7 @@ def run(circuit_name, base_dir=None):
 
     n_in     = len(inputs)
     n_faults = len(faults)
-    stop_at  = math.ceil(0.95 * n_faults)
+    stop_at  = math.ceil((TARGET_COVERAGE/100.0) * n_faults)
 
     use_random = (n_in > MAX_EXHAUSTIVE_INPUTS)
     RANDOM_BUDGET = max(5000, 10 * n_faults)
@@ -175,24 +159,29 @@ def run(circuit_name, base_dir=None):
 
     print(f"[3/4] Circuit summary:")
     print(f"      Inputs / Outputs / Gates : {n_in} / {len(outputs)} / {len(gates)}")
-    print(f"      Faults  : {n_faults}  |  Target (95%) : {stop_at}")
+    print(f"      Faults  : {n_faults}  |  Target ({TARGET_COVERAGE}%) : {stop_at}")
     print(f"      Timeout : {TIMEOUT_SECONDS}s  |  Mode : {'random+targeted' if use_random else 'exhaustive'}")
     print(f"[4/4] Running...\n")
 
-    remaining_set    = set(range(n_faults))
-    test_set         = []
-    detected         = 0
-    vec_examined     = 0
-    timeout_hit      = False
-    consecutive_miss = 0
-    lines            = []
+    remaining_set       = set(range(n_faults))
+    test_set            = []
+    detected            = 0
+    vec_examined        = 0
+    consecutive_miss    = 0
+    last_batch_coverage = 0.0
+    
+    timeout_hit = False
+    plateau_hit = False
+    stop_reason = ""
+    lines       = []
     random.seed(42)
 
     def log(s=''):
         print(s)
         lines.append(s)
 
-    # ---- helpers ----
+    t_start = time.time()
+
     def timed_out():
         return (time.time() - t_start) >= TIMEOUT_SECONDS
 
@@ -206,143 +195,130 @@ def run(circuit_name, base_dir=None):
                 newly.append(fi)
         return newly
 
-    def accept(vec, newly, label='Phase1'):
-        nonlocal detected, consecutive_miss
-        for fi in newly:
-            remaining_set.discard(fi)
-        detected += len(newly)
-        consecutive_miss = 0
-        test_set.append(vec)
-        rem = n_faults - detected
-        cov = detected / n_faults * 100.0
-        t   = time.time() - t_start
-        vstr = ''.join(str(b) for b in vec)
-        if n_in > 24:
-            vstr = vstr[:24] + '...'
-        log(f"  [{label}] v={vstr}  +{len(newly):3d} | "
-            f"det={detected:4d} rem={rem:4d} cov={cov:5.2f}%  [{t:.1f}s]")
+    # ================================================================
+    #  MAIN SIMULATION LOOP WITH CSV CONTEXT
+    # ================================================================
+    with open(csv_file, 'w') as f_csv:
+        f_csv.write("Vector_Index,Time_Seconds,Total_Detected,Delta_Detected,Coverage_Percent,Delta_Coverage\n")
 
-    # ---- header ----
-    log("=" * 68)
-    log(f"  ISCAS {circuit_name} – Iterative Test Generation + Fault Dropping")
-    log("=" * 68)
-    log(f"  Inputs / Outputs / Gates : {n_in} / {len(outputs)} / {len(gates)}")
-    log(f"  Total faults             : {n_faults}")
-    log(f"  Target (>=95%)           : {stop_at} detected")
-    log(f"  Timeout                  : {TIMEOUT_SECONDS}s")
-    log("-" * 68)
+        # Unified processor for all vectors
+        def process_vector(vec, label):
+            nonlocal vec_examined, detected, consecutive_miss, last_batch_coverage
+            nonlocal plateau_hit, stop_reason
+            
+            vec_examined += 1
+            newly = sim_vec(vec)
+            delta = len(newly)
+            
+            if newly:
+                for fi in newly:
+                    remaining_set.discard(fi)
+                detected += delta
+                consecutive_miss = 0
+                test_set.append(vec)
+                rem = n_faults - detected
+                cov = detected / n_faults * 100.0
+                t = time.time() - t_start
+                vstr = ''.join(str(b) for b in vec)
+                if n_in > 24: vstr = vstr[:24] + '...'
+                log(f"  [{label}] v={vstr}  +{delta:3d} | det={detected:4d} rem={rem:4d} cov={cov:5.2f}%  [{t:.1f}s]")
+            elif label == 'Phase1':
+                consecutive_miss += 1
+                
+            curr_cov = (detected / n_faults) * 100.0
+            delta_cov = (delta / n_faults) * 100.0
+            elapsed = time.time() - t_start
+            
+            # Log to CSV
+            f_csv.write(f"{vec_examined},{elapsed:.4f},{detected},{delta},{curr_cov:.4f},{delta_cov:.4f}\n")
+            
+            # Check for plateau
+            if vec_examined > 0 and vec_examined % BATCH_SIZE == 0:
+                if (curr_cov - last_batch_coverage) < MIN_IMPROVEMENT:
+                    plateau_hit = True
+                    stop_reason = f"Coverage plateaued (<{MIN_IMPROVEMENT}% improvement over {BATCH_SIZE} vectors)"
+                last_batch_coverage = curr_cov
+                
+            return len(newly) > 0
 
-    t_start = time.time()
+        # ---- header ----
+        log("=" * 68)
+        log(f"  ISCAS {circuit_name} – Iterative Test Generation + Fault Dropping")
+        log("-" * 68)
+
+        log("\n[Phase 1] Main loop\n")
+
+        for vi in range(n_vectors):
+            if timed_out():
+                timeout_hit = True
+                stop_reason = f"{TIMEOUT_SECONDS}s Time Limit Exceeded"
+                break
+            if detected >= stop_at:
+                stop_reason = f"{TARGET_COVERAGE}% Coverage Reached"
+                break
+            if plateau_hit:
+                break
+
+            vec = ([random.randint(0, 1) for _ in range(n_in)]
+                   if use_random else [(vi >> (n_in - 1 - b)) & 1 for b in range(n_in)])
+
+            process_vector(vec, 'Phase1')
+
+            # ============================================================
+            #  PHASE 2 – targeted mode on stall
+            # ============================================================
+            if (not timeout_hit and not plateau_hit and consecutive_miss >= STALL_THRESHOLD and remaining_set):
+                log(f"\n[Phase 2 – TARGETED] {consecutive_miss} misses → targeting {len(remaining_set)} remaining faults\n")
+                consecutive_miss = 0
+
+                rem_list = list(remaining_set)
+                random.shuffle(rem_list)
+
+                for fi in rem_list:
+                    if timed_out(): timeout_hit = True; stop_reason = f"{TIMEOUT_SECONDS}s Time Limit Exceeded"; break
+                    if detected >= stop_at: stop_reason = f"{TARGET_COVERAGE}% Coverage Reached"; break
+                    if plateau_hit: break
+                    if fi not in remaining_set: continue
+
+                    found = False
+
+                    # 2a. Random targeted tries
+                    for _ in range(TARGETED_RAND_TRIES):
+                        if timed_out(): timeout_hit = True; stop_reason = f"{TIMEOUT_SECONDS}s Time Limit Exceeded"; break
+                        if plateau_hit or fi not in remaining_set: break
+                        
+                        vec2 = [random.randint(0, 1) for _ in range(n_in)]
+                        if process_vector(vec2, 'Targeted'):
+                            found = True
+                            break
+
+                    if timeout_hit or plateau_hit: break
+                    if found or fi not in remaining_set: continue
+
+                    # 2b. Partial exhaustive
+                    ebits = min(TARGETED_EXHAUST_BITS, n_in)
+                    for mask in range(2 ** ebits):
+                        if timed_out(): timeout_hit = True; stop_reason = f"{TIMEOUT_SECONDS}s Time Limit Exceeded"; break
+                        if plateau_hit or fi not in remaining_set: break
+                        
+                        base = [random.randint(0, 1)] * n_in
+                        for b in range(ebits):
+                            base[b] = (mask >> (ebits - 1 - b)) & 1
+                            
+                        if process_vector(base, 'Exhaustive'):
+                            found = True
+                            break
+
+                    if timeout_hit or plateau_hit: break
 
     # ================================================================
-    #  PHASE 1 – main random / exhaustive loop
-    # ================================================================
-    log("\n[Phase 1] Main loop\n")
-
-    for vi in range(n_vectors):
-        # --- check timeout ---
-        if timed_out():
-            timeout_hit = True
-            log(f"\n  [TIMEOUT] {TIMEOUT_SECONDS}s limit reached in Phase 1 "
-                f"– saving current results.")
-            break
-
-        if detected >= stop_at:
-            break
-
-        vec = ([random.randint(0, 1) for _ in range(n_in)]
-               if use_random
-               else [(vi >> (n_in - 1 - b)) & 1 for b in range(n_in)])
-
-        vec_examined += 1
-        newly = sim_vec(vec)
-
-        if newly:
-            accept(vec, newly, label='Phase1')
-        else:
-            consecutive_miss += 1
-
-        # ============================================================
-        #  PHASE 2 – targeted mode on stall
-        # ============================================================
-        if (not timeout_hit
-                and consecutive_miss >= STALL_THRESHOLD
-                and remaining_set):
-
-            log(f"\n[Phase 2 – TARGETED] {consecutive_miss} misses → "
-                f"targeting {len(remaining_set)} remaining faults\n")
-            consecutive_miss = 0
-
-            rem_list = list(remaining_set)
-            random.shuffle(rem_list)
-
-            for fi in rem_list:
-                # --- timeout check inside targeted loop ---
-                if timed_out():
-                    timeout_hit = True
-                    log(f"\n  [TIMEOUT] {TIMEOUT_SECONDS}s limit reached in Phase 2 "
-                        f"– saving current results.")
-                    break
-
-                if detected >= stop_at:
-                    break
-                if fi not in remaining_set:
-                    continue
-
-                found = False
-
-                # 2a. Random targeted tries
-                for _ in range(TARGETED_RAND_TRIES):
-                    if timed_out():
-                        timeout_hit = True
-                        break
-                    if fi not in remaining_set:
-                        break
-                    vec2 = [random.randint(0, 1) for _ in range(n_in)]
-                    vec_examined += 1
-                    newly2 = sim_vec(vec2)
-                    if newly2:
-                        accept(vec2, newly2, label='Targeted')
-                        found = True
-                        break
-
-                if timeout_hit:
-                    break
-                if found or fi not in remaining_set:
-                    continue
-
-                # 2b. Partial exhaustive
-                ebits = min(TARGETED_EXHAUST_BITS, n_in)
-                for mask in range(2 ** ebits):
-                    if timed_out():
-                        timeout_hit = True
-                        break
-                    if fi not in remaining_set:
-                        break
-                    base = [random.randint(0, 1)] * n_in
-                    for b in range(ebits):
-                        base[b] = (mask >> (ebits - 1 - b)) & 1
-                    vec_examined += 1
-                    newly2 = sim_vec(base)
-                    if newly2:
-                        accept(base, newly2, label='Exhaustive')
-                        found = True
-                        break
-
-                if timeout_hit:
-                    break
-
-            # After targeted sweep, return to Phase 1 loop
-            # (loop will re-check timeout at top)
-
-    # ================================================================
-    #  FINAL REPORT  (written regardless of how we stopped)
+    #  FINAL REPORT
     # ================================================================
     elapsed_total    = time.time() - t_start
     remaining_faults = [faults[fi] for fi in remaining_set]
-    stop_reason      = ("TIMEOUT" if timeout_hit
-                        else "95% REACHED" if detected >= stop_at
-                        else "VECTORS EXHAUSTED")
+    
+    if not stop_reason:
+        stop_reason = "VECTORS EXHAUSTED"
 
     log("\n" + "=" * 68)
     log("  FINAL REPORT")
@@ -357,22 +333,7 @@ def run(circuit_name, base_dir=None):
     log(f"  Vectors examined : {vec_examined}")
     log(f"  Elapsed time     : {elapsed_total:.2f}s")
     log("-" * 68)
-    log("  Accepted Test Vectors:")
-    for i, v in enumerate(test_set):
-        log(f"    T[{i:3d}] = {''.join(str(b) for b in v)}")
-    log("-" * 68)
-    if remaining_faults:
-        log(f"  Remaining undetected faults ({len(remaining_faults)}"
-            f"{' – likely redundant or hard' if not timeout_hit else ' – timeout, may be detectable'}):")
-        for f in remaining_faults[:40]:
-            if f[0] == 'STEM':
-                log(f"    STEM   {f[1]} SA{f[3]}")
-            else:
-                log(f"    BRANCH {f[1]}->{f[2]} SA{f[3]}")
-        if len(remaining_faults) > 40:
-            log(f"    ... and {len(remaining_faults) - 40} more")
-    else:
-        log("  Remaining faults : (none – 100% coverage)")
+    log(f"  Plot Data Saved  : {csv_file}")
     log("=" * 68)
 
     with open(out_file, 'w') as f:
@@ -382,11 +343,9 @@ def run(circuit_name, base_dir=None):
     final_cov = detected / n_faults * 100.0
     return final_cov, timeout_hit
 
-
 # ============================================================
 #  5.  ENTRY POINT
 # ============================================================
-
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Usage:")
@@ -397,17 +356,12 @@ if __name__ == '__main__':
 
     arg = sys.argv[1].lower()
     circuits = ALL_CIRCUITS if arg == 'all' else [arg]
-
     summary = []
 
     for circuit in circuits:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-        # Check files exist before attempting
-        vf = os.path.join(base_dir, 'circuits', 'expanded_verilog',
-                          f'{circuit}_expanded.v')
-        ff = os.path.join(base_dir, 'experiment_results',
-                          f'fault_report_{circuit}.txt')
+        vf = os.path.join(base_dir, 'circuits', 'expanded_verilog', f'{circuit}_expanded.v')
+        ff = os.path.join(base_dir, 'experiment_results', f'fault_report_{circuit}.txt')
 
         if not os.path.exists(vf):
             msg = f"  SKIP {circuit:8s} – missing {vf}"
@@ -432,7 +386,6 @@ if __name__ == '__main__':
             print(f"  ERROR running {circuit}: {e}")
             summary.append((circuit, None, None, f'ERROR: {e}'))
 
-    # ---- batch summary ----
     if len(circuits) > 1:
         print(f"\n{'='*68}")
         print("  BATCH SUMMARY")
